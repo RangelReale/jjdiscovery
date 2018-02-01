@@ -24,6 +24,7 @@ type Server struct {
 type serverOptions struct {
 	ttlSec  int
 	logfunc LogFunc
+	tag     string
 }
 
 func NewServer(consulcli *consul.Client, opts ...ServerOption) *Server {
@@ -34,6 +35,7 @@ func NewServer(consulcli *consul.Client, opts ...ServerOption) *Server {
 		services:  make(map[string]*serverService),
 		opts: serverOptions{
 			ttlSec: 30,
+			tag:    "jjdiscovery",
 		},
 	}
 
@@ -59,9 +61,11 @@ func (s *Server) DeregisterAll() {
 	s.m.Unlock()
 
 	for _, rd := range dr {
+		s.log(LEVEL_INFO, fmt.Sprintf("[server.deregister_all] deregistering service %s:%s", rd.service, rd.sid))
+
 		err := s.Deregister(rd.service, rd.sid)
 		if err != nil {
-			s.log(fmt.Sprintf("[server.deregister_all][ERROR] service %s:%s could not be deregistered: %v", rd.service, rd.sid, err))
+			s.log(LEVEL_ERROR, fmt.Sprintf("[server.deregister_all] service %s:%s could not be deregistered: %v", rd.service, rd.sid, err))
 		}
 	}
 }
@@ -128,7 +132,10 @@ func (s *Server) Deregister(service string, sid string) error {
 		return errors.New("Sid not found")
 	}
 
-	err := s.consulcli.Agent().ServiceDeregister(sa.sid)
+	var err error
+	if sa.registered {
+		err = s.consulcli.Agent().ServiceDeregister(sa.sid)
+	}
 
 	// remove local reference before returning error
 	delete(svc.addressList, sid)
@@ -140,9 +147,25 @@ func (s *Server) Deregister(service string, sid string) error {
 	return err
 }
 
+func (s *Server) ServiceStatus(service string) *ServerServiceStatus {
+	s.m.Lock()
+	defer s.m.Unlock()
+
+	return nil
+}
+
+func (s *Server) ServiceAddressStatus(service string) *ServerServiceStatus {
+	s.m.Lock()
+	defer s.m.Unlock()
+
+	return nil
+}
+
 func (s *Server) check() {
 	finished := false
 	had_check := true
+	// try to register pending every 1 minute
+	register_ticker := time.NewTicker(time.Minute)
 	for !finished {
 		delay := time.Second * time.Duration(s.opts.ttlSec/4)
 		if had_check {
@@ -151,11 +174,17 @@ func (s *Server) check() {
 
 		select {
 		case <-s.checkchan:
+			// close channel
 			finished = true
 		case rd := <-s.regchan:
-			s.do_register(rd)
+			// new registration
+			s.do_register_regdata(rd)
 		case <-time.After(delay):
+			// update ttl
 			had_check = s.do_check()
+		case <-register_ticker.C:
+			// register pending every minute
+			s.do_register()
 		}
 	}
 }
@@ -184,13 +213,13 @@ func (s *Server) do_check_item() bool {
 	}
 
 	if oldest != nil {
-		s.log(fmt.Sprintf("[server.do_check] service %s:%s update ttl", oldestservice, oldest.sid))
+		s.log(LEVEL_DEBUG, fmt.Sprintf("[server.do_check] service %s:%s update ttl", oldestservice, oldest.sid))
 
 		oldest.lastCheck = time.Now()
 
 		err := s.consulcli.Agent().UpdateTTL(fmt.Sprintf("service:%s", oldest.sid), "", consul.HealthPassing)
 		if err != nil {
-			s.log(fmt.Sprintf("[server.do_check][ERROR] service %s:%s error in update ttl, re-registering: %v", oldestservice, oldest.sid, err))
+			s.log(LEVEL_ERROR, fmt.Sprintf("[server.do_check] service %s:%s error in update ttl, re-registering: %v", oldestservice, oldest.sid, err))
 
 			// error, re-register
 			oldest.registered = false
@@ -203,21 +232,43 @@ func (s *Server) do_check_item() bool {
 	return false
 }
 
-func (s *Server) do_register(reg regdata) {
+func (s *Server) do_register() bool {
 	s.m.Lock()
 	defer s.m.Unlock()
 
-	s.log(fmt.Sprintf("[server.do_register] registering service %s:%s", reg.service, reg.sid))
+	return s.do_register_item()
+}
+
+func (s *Server) do_register_item() bool {
+	ret := false
+
+	for _, svc := range s.services {
+		for _, a := range svc.addressList {
+			if !a.registered {
+				s.do_register_internal(svc, a)
+				if a.registered {
+					ret = true
+				}
+			}
+		}
+	}
+
+	return ret
+}
+
+func (s *Server) do_register_regdata(reg regdata) {
+	s.m.Lock()
+	defer s.m.Unlock()
 
 	service, ok := s.services[reg.service]
 	if !ok {
-		s.log(fmt.Sprintf("[server.do_register][ERROR] service %s:%s not found", reg.service, reg.sid))
+		s.log(LEVEL_ERROR, fmt.Sprintf("[server.do_register_regdata] service %s:%s not found", reg.service, reg.sid))
 		return
 	}
 
 	address, ok := service.addressList[reg.sid]
 	if !ok {
-		s.log(fmt.Sprintf("[server.do_register][ERROR] service %s:%s address not found", reg.service, reg.sid))
+		s.log(LEVEL_ERROR, fmt.Sprintf("[server.do_register_regdata] service %s:%s address not found", reg.service, reg.sid))
 		return
 	}
 
@@ -225,12 +276,24 @@ func (s *Server) do_register(reg regdata) {
 		return
 	}
 
+	s.do_register_internal(service, address)
+}
+
+// Mutex MUST be locked before this call
+func (s *Server) do_register_internal(service *serverService, address *serverServiceAddress) {
+	if address.registered {
+		return
+	}
+
+	s.log(LEVEL_INFO, fmt.Sprintf("[server.do_register_internal] registering service %s:%s", service.service, address.sid))
+
 	// register with consul
 	err := s.consulcli.Agent().ServiceRegister(&consul.AgentServiceRegistration{
 		ID:   address.sid,
 		Name: service.service,
 		Tags: []string{
 			fmt.Sprintf("v%s", address.version.String()),
+			s.opts.tag,
 			//fmt.Sprintf("addr%s:%d", address, port),
 		},
 		Port: address.port,
@@ -240,7 +303,7 @@ func (s *Server) do_register(reg regdata) {
 		},
 	})
 	if err != nil {
-		s.log(fmt.Sprintf("[server.do_register][ERROR] error registering service %s:%s with consul: %v", reg.service, reg.sid, err))
+		s.log(LEVEL_ERROR, fmt.Sprintf("[server.do_register] error registering service %s:%s with consul: %v", service.service, address.sid, err))
 		return
 	}
 
@@ -251,9 +314,9 @@ func (s *Server) do_register(reg regdata) {
 	address.lastCheck = time.Now()
 }
 
-func (s *Server) log(msg string) {
+func (s *Server) log(level LogLevel, msg string) {
 	if s.opts.logfunc != nil {
-		s.opts.logfunc(msg)
+		s.opts.logfunc(level, msg)
 	}
 }
 
@@ -275,6 +338,12 @@ func ServerLogFunc(logFunc LogFunc) ServerOption {
 	}
 }
 
+func ServerTag(tag string) ServerOption {
+	return func(o *serverOptions) {
+		o.tag = tag
+	}
+}
+
 //
 // service
 //
@@ -291,6 +360,21 @@ type serverServiceAddress struct {
 	version    semver.Version
 	registered bool
 	lastCheck  time.Time
+}
+
+//
+// service status
+//
+
+type ServerServiceStatus struct {
+	Service     string
+	AddressList map[string]*ServerServiceAddressStatus
+}
+
+type ServerServiceAddressStatus struct {
+	Sid        string
+	Registered bool
+	LastCheck  time.Time
 }
 
 //
