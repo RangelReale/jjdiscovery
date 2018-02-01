@@ -16,26 +16,27 @@ type Server struct {
 	checkchan chan bool
 	regchan   chan regdata
 	services  map[string]*serverService
-	m         sync.Mutex
+	m         sync.RWMutex
 
 	opts serverOptions
 }
 
 type serverOptions struct {
-	ttlSec  int
-	tag     string
-	logfunc LogFunc
+	consulConfig *consul.Config
+	ttlSec       int
+	tag          string
+	logfunc      LogFunc
 }
 
-func NewServer(consulcli *consul.Client, opts ...ServerOption) *Server {
+func NewServer(opts ...ServerOption) (*Server, error) {
 	ret := &Server{
-		consulcli: consulcli,
 		checkchan: make(chan bool),
 		regchan:   make(chan regdata, 10),
 		services:  make(map[string]*serverService),
 		opts: serverOptions{
-			ttlSec: 30,
-			tag:    DefaultTag,
+			consulConfig: consul.DefaultConfig(),
+			ttlSec:       30,
+			tag:          DefaultTag,
 		},
 	}
 
@@ -43,22 +44,28 @@ func NewServer(consulcli *consul.Client, opts ...ServerOption) *Server {
 		opt(&ret.opts)
 	}
 
+	var err error
+	ret.consulcli, err = consul.NewClient(ret.opts.consulConfig)
+	if err != nil {
+		return nil, err
+	}
+
 	// start ttl and registration service
 	go ret.check()
 
-	return ret
+	return ret, nil
 }
 
 func (s *Server) DeregisterAll() {
 	var dr []regdata
 
-	s.m.Lock()
+	s.m.RLock()
 	for _, svc := range s.services {
 		for _, a := range svc.addressList {
 			dr = append(dr, regdata{service: svc.service, sid: a.sid})
 		}
 	}
-	s.m.Unlock()
+	s.m.RUnlock()
 
 	for _, rd := range dr {
 		s.log(LEVEL_INFO, fmt.Sprintf("[server.deregister_all] deregistering service %s:%s", rd.service, rd.sid))
@@ -142,8 +149,8 @@ func (s *Server) Deregister(service string, sid string) error {
 }
 
 func (s *Server) ServiceStatus(service string) *ServerServiceStatus {
-	s.m.Lock()
-	defer s.m.Unlock()
+	s.m.RLock()
+	defer s.m.RUnlock()
 
 	svc, ok := s.services[service]
 	if !ok {
@@ -165,8 +172,8 @@ func (s *Server) ServiceStatus(service string) *ServerServiceStatus {
 }
 
 func (s *Server) ServiceAddressStatus(service string, sid string) *ServerServiceAddressStatus {
-	s.m.Lock()
-	defer s.m.Unlock()
+	s.m.RLock()
+	defer s.m.RUnlock()
 
 	svc, ok := s.services[service]
 	if !ok {
@@ -365,6 +372,12 @@ func ServerLogFunc(logFunc LogFunc) ServerOption {
 func ServerTag(tag string) ServerOption {
 	return func(o *serverOptions) {
 		o.tag = tag
+	}
+}
+
+func ServerConsulConfig(consulConfig *consul.Config) ServerOption {
+	return func(o *serverOptions) {
+		o.consulConfig = consulConfig
 	}
 }
 

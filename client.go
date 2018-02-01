@@ -6,25 +6,27 @@ import (
 
 	"github.com/blang/semver"
 	consul "github.com/hashicorp/consul/api"
+	"github.com/hashicorp/consul/watch"
 )
 
 type Client struct {
 	consulcli *consul.Client
-	m         sync.Mutex
+	m         sync.RWMutex
 
 	opts clientOptions
 }
 
 type clientOptions struct {
-	tag     string
-	logfunc LogFunc
+	consulConfig *consul.Config
+	tag          string
+	logfunc      LogFunc
 }
 
-func NewClient(consulcli *consul.Client, opts ...ClientOption) *Client {
+func NewClient(opts ...ClientOption) (*Client, error) {
 	ret := &Client{
-		consulcli: consulcli,
 		opts: clientOptions{
-			tag: DefaultTag,
+			consulConfig: consul.DefaultConfig(),
+			tag:          DefaultTag,
 		},
 	}
 
@@ -32,7 +34,13 @@ func NewClient(consulcli *consul.Client, opts ...ClientOption) *Client {
 		opt(&ret.opts)
 	}
 
-	return ret
+	var err error
+	ret.consulcli, err = consul.NewClient(ret.opts.consulConfig)
+	if err != nil {
+		return nil, err
+	}
+
+	return ret, nil
 }
 
 func (c *Client) Close() {
@@ -40,6 +48,9 @@ func (c *Client) Close() {
 }
 
 func (c *Client) Get(service string, opts ...ClientGetOption) (*ClientService, error) {
+	c.m.RLock()
+	defer c.m.RUnlock()
+
 	var getOpts clientGetOptions
 	for _, opt := range opts {
 		opt(&getOpts)
@@ -50,6 +61,16 @@ func (c *Client) Get(service string, opts ...ClientGetOption) (*ClientService, e
 		return nil, err
 	}
 
+	return c.parseResult(service, servicelist, getOpts), nil
+}
+
+func (c *Client) log(level LogLevel, msg string) {
+	if c.opts.logfunc != nil {
+		c.opts.logfunc(level, msg)
+	}
+}
+
+func (c *Client) parseResult(service string, servicelist []*consul.ServiceEntry, getOpts clientGetOptions) *ClientService {
 	ret := &ClientService{
 		Service: service,
 	}
@@ -78,14 +99,69 @@ func (c *Client) Get(service string, opts ...ClientGetOption) (*ClientService, e
 			Version: version,
 		})
 	}
+	return ret
+}
+
+//
+// ClientWatcher
+//
+
+type ClientWatcher struct {
+	C chan *ClientService
+
+	wp      *watch.Plan
+	service string
+	client  *Client
+	getOpts clientGetOptions
+}
+
+func (c *Client) Watch(service string, opts ...ClientGetOption) (*ClientWatcher, error) {
+	c.m.RLock()
+	defer c.m.RUnlock()
+
+	ret := &ClientWatcher{
+		C:       make(chan *ClientService, 20),
+		service: service,
+		client:  c,
+	}
+
+	for _, opt := range opts {
+		opt(&ret.getOpts)
+	}
+
+	wparams := map[string]interface{}{
+		"type":    "service",
+		"service": service,
+		"tag":     c.opts.tag,
+	}
+	if !ret.getOpts.returnInactive {
+		wparams["passingonly"] = false
+	}
+
+	var err error
+	ret.wp, err = watch.Parse(wparams)
+	if err != nil {
+		return nil, err
+	}
+
+	ret.wp.Handler = ret.handle
+	go ret.wp.Run(c.opts.consulConfig.Address)
 
 	return ret, nil
 }
 
-func (c *Client) log(level LogLevel, msg string) {
-	if c.opts.logfunc != nil {
-		c.opts.logfunc(level, msg)
+func (cw *ClientWatcher) Stop() {
+	cw.C <- nil
+	cw.wp.Stop()
+}
+
+func (cw *ClientWatcher) handle(idx uint64, data interface{}) {
+	servicelist, ok := data.([]*consul.ServiceEntry)
+	if !ok {
+		return
 	}
+
+	cw.C <- cw.client.parseResult(cw.service, servicelist, cw.getOpts)
 }
 
 //
@@ -114,6 +190,12 @@ type ClientOption func(options *clientOptions)
 func ClientTag(tag string) ClientOption {
 	return func(o *clientOptions) {
 		o.tag = tag
+	}
+}
+
+func ClientConsulConfig(consulConfig *consul.Config) ClientOption {
+	return func(o *clientOptions) {
+		o.consulConfig = consulConfig
 	}
 }
 
