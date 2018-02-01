@@ -23,8 +23,8 @@ type Server struct {
 
 type serverOptions struct {
 	ttlSec  int
-	logfunc LogFunc
 	tag     string
+	logfunc LogFunc
 }
 
 func NewServer(consulcli *consul.Client, opts ...ServerOption) *Server {
@@ -35,7 +35,7 @@ func NewServer(consulcli *consul.Client, opts ...ServerOption) *Server {
 		services:  make(map[string]*serverService),
 		opts: serverOptions{
 			ttlSec: 30,
-			tag:    "jjdiscovery",
+			tag:    DefaultTag,
 		},
 	}
 
@@ -80,15 +80,9 @@ func (s *Server) Close(deregister bool) {
 	}
 }
 
-func (s *Server) Register(service string, address string, port int, version string) (string, error) {
+func (s *Server) Register(service string, address string, port int, version semver.Version) (string, error) {
 	s.m.Lock()
 	defer s.m.Unlock()
-
-	// parse version
-	ver, err := semver.Make(version)
-	if err != nil {
-		return "", err
-	}
 
 	// create random sid
 	sid := uuid.NewV4().String()
@@ -107,7 +101,7 @@ func (s *Server) Register(service string, address string, port int, version stri
 		sid:        sid,
 		address:    address,
 		port:       port,
-		version:    ver,
+		version:    version,
 		registered: false,
 		lastCheck:  time.Now(),
 	}
@@ -151,14 +145,44 @@ func (s *Server) ServiceStatus(service string) *ServerServiceStatus {
 	s.m.Lock()
 	defer s.m.Unlock()
 
-	return nil
+	svc, ok := s.services[service]
+	if !ok {
+		return nil
+	}
+
+	ret := &ServerServiceStatus{
+		Service: svc.service,
+	}
+	for sid, address := range svc.addressList {
+		ret.AddressList[sid] = &ServerServiceAddressStatus{
+			Sid:        address.sid,
+			Registered: address.registered,
+			LastCheck:  address.lastCheck,
+		}
+	}
+
+	return ret
 }
 
-func (s *Server) ServiceAddressStatus(service string) *ServerServiceStatus {
+func (s *Server) ServiceAddressStatus(service string, sid string) *ServerServiceAddressStatus {
 	s.m.Lock()
 	defer s.m.Unlock()
 
-	return nil
+	svc, ok := s.services[service]
+	if !ok {
+		return nil
+	}
+
+	address, ok := svc.addressList[sid]
+	if !ok {
+		return nil
+	}
+
+	return &ServerServiceAddressStatus{
+		Sid:        address.sid,
+		Registered: address.registered,
+		LastCheck:  address.lastCheck,
+	}
 }
 
 func (s *Server) check() {
